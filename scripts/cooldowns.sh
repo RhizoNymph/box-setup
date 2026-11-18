@@ -16,21 +16,27 @@
 #   poetry   >= 2.4.0    solver.min-release-age (days)      poetry global config
 #   cargo    >= 1.100    [registry] global-min-publish-age  ~/.cargo/config.toml
 #                        (nightly 1.98-1.99: also [unstable] min-publish-age)
+#   gem      >= 4.1.0    :cooldown: (days)                  ~/.gemrc
 #   bundler  >= 4.0.13   cooldown (days)                    bundle global config
 #   composer             policy.cooldown.period ("N days")  composer global config
 #   hex                  cooldown ("Nd")                    ~/.hex (mix hex.config)
 #   mise                 minimum_release_age ("Nd")         ~/.config/mise/config.toml
 #
-# Usage: cooldowns.sh [--days N]   (default 3; env COOLDOWN_DAYS also honored)
+# A manager too old for its setting is reported and left untouched: nothing
+# is written that the installed version can't read. (Exception: cargo, whose
+# config is shared by every rustup toolchain and which ignores unknown keys.)
+#
+# Usage: cooldowns.sh [--days N]   (default 7; env COOLDOWN_DAYS also honored)
 
 set -euo pipefail
 
 # ---------------------------------------------------------------- arguments
 
-AGE_DAYS="${COOLDOWN_DAYS:-3}"
+AGE_DAYS="${COOLDOWN_DAYS:-7}"
 
 usage() {
-  sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+  # the header comment above, up to the first non-comment line
+  awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
   exit 0
 }
 
@@ -73,6 +79,15 @@ BUNFIG="$HOME/.bunfig.toml"
 # npm (and deno, which reads the same file) honor a relocated user npmrc.
 NPMRC="${NPM_CONFIG_USERCONFIG:-${npm_config_userconfig:-$HOME/.npmrc}}"
 YARNRC="$HOME/.yarnrc.yml"
+# RubyGems: $GEMRC (first entry) if set, else ~/.gemrc, else the XDG file
+# when only that one exists.
+if [ -n "${GEMRC:-}" ]; then
+  GEMRC_FILE="${GEMRC%%:*}"
+elif [ ! -f "$HOME/.gemrc" ] && [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/gem/gemrc" ]; then
+  GEMRC_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/gem/gemrc"
+else
+  GEMRC_FILE="$HOME/.gemrc"
+fi
 
 # ---------------------------------------------------------------- helpers
 
@@ -257,27 +272,29 @@ setup_yarn() {
   if ! have yarn; then skip "yarn: not installed"; return 0; fi
   local v; v="$(tool_ver yarn)"
   [ -n "$v" ] || { warn "yarn: installed but 'yarn --version' failed"; return 0; }
-  # Written directly rather than via `yarn config set --home`: outside a
-  # project directory corepack may hand us Yarn Classic, which can't write
-  # Berry config. Berry >= 4.10 reads ~/.yarnrc.yml; Classic ignores it.
-  set_flat_key "$YARNRC" npmMinimalAgeGate ": " "$AGE_MINUTES"
-  if ver_ge "$v" 4.10.0; then
-    ok "yarn $v: npmMinimalAgeGate=$AGE_MINUTES minutes -> $YARNRC"
-  else
-    warn "yarn $v has no cooldown support (needs Berry >= 4.10); wrote $YARNRC anyway for when you upgrade"
+  # Not written for older versions: Berry < 4.10 rejects unknown settings in
+  # ~/.yarnrc.yml and would stop working entirely.
+  if ! ver_ge "$v" 4.10.0; then
+    warn "yarn $v: npmMinimalAgeGate needs Yarn Berry >= 4.10; not configured (run this script inside a Berry >= 4.10 project to configure it, or set YARN_NPM_MINIMAL_AGE_GATE=$AGE_MINUTES)"
+    return 0
   fi
+  # Written directly rather than via `yarn config set --home`: corepack may
+  # hand a different yarn to other directories.
+  set_flat_key "$YARNRC" npmMinimalAgeGate ": " "$AGE_MINUTES"
+  ok "yarn $v: npmMinimalAgeGate=$AGE_MINUTES minutes -> $YARNRC"
+  info "yarn: projects pinned to Berry < 4.10 (packageManager field) also read $YARNRC and will reject this key; upgrade them or remove it"
 }
 
 setup_bun() {
   have bun || { skip "bun: not installed"; return 0; }
   local v; v="$(tool_ver bun)"
   [ -n "$v" ] || { warn "bun: installed but 'bun --version' failed"; return 0; }
-  set_toml_key "$BUNFIG" install minimumReleaseAge "$AGE_SECONDS"
-  if ver_ge "$v" 1.3.0; then
-    ok "bun $v: [install] minimumReleaseAge=$AGE_SECONDS seconds -> $BUNFIG"
-  else
-    warn "bun $v ignores minimumReleaseAge (needs >= 1.3.0); wrote $BUNFIG anyway for when you upgrade"
+  if ! ver_ge "$v" 1.3.0; then
+    warn "bun $v: minimumReleaseAge needs bun >= 1.3.0; not configured (bun upgrade)"
+    return 0
   fi
+  set_toml_key "$BUNFIG" install minimumReleaseAge "$AGE_SECONDS"
+  ok "bun $v: [install] minimumReleaseAge=$AGE_SECONDS seconds -> $BUNFIG"
 }
 
 setup_deno() {
@@ -290,8 +307,10 @@ setup_deno() {
   fi
   # Deno honors min-release-age from .npmrc for npm dependencies; make sure
   # it is present even when npm itself is absent or too old to have set it.
+  # An older npm only warns about the unknown key; it keeps working.
   if ! have npm || ! ver_ge "$(tool_ver npm)" 11.10.0; then
     set_flat_key "$NPMRC" min-release-age "=" "$AGE_DAYS"
+    have npm && info "deno: wrote min-release-age to $NPMRC for deno; your npm is too old to use it and may print an 'unknown config' warning"
   fi
   if ver_ge "$v" 2.9.0; then
     ok "deno $v: 24h cooldown built in by default; min-release-age=$AGE_DAYS days in $NPMRC covers npm deps"
@@ -309,8 +328,9 @@ setup_uv() {
     set_toml_key "$UV_TOML" "" exclude-newer "\"$AGE_DAYS days\""
     ok "uv $v: exclude-newer=\"$AGE_DAYS days\" -> $UV_TOML"
     info "uv: the resolved cutoff timestamp is pinned into uv.lock; it advances on the next re-resolution, not with wall-clock time"
+    info "uv: any other uv < 0.9.17 on this machine (pipx, pinned CI copies) reads the same uv.toml and will fail to parse the relative value"
   else
-    warn "uv $v: relative exclude-newer durations need uv >= 0.9.17; upgrade uv"
+    warn "uv $v: relative exclude-newer durations need uv >= 0.9.17; not configured (uv self update)"
   fi
 }
 
@@ -367,7 +387,7 @@ setup_cargo() {
     set_toml_key "$CARGO_CONFIG" unstable min-publish-age true
     ok "cargo $v (nightly): global-min-publish-age=\"$AGE_DAYS days\" via [unstable] min-publish-age -> $CARGO_CONFIG"
   else
-    warn "cargo $v: min-publish-age needs cargo >= 1.100 (rustup update stable); wrote $CARGO_CONFIG anyway for when you upgrade"
+    warn "cargo $v: min-publish-age needs cargo >= 1.100 (rustup update); wrote $CARGO_CONFIG anyway since older cargo ignores it and newer toolchains share the file"
   fi
   # The config file is shared by all toolchains; flag an outdated stable one.
   # Only when a stable toolchain is installed: `rustup run` may otherwise
@@ -386,13 +406,29 @@ setup_bundler() {
   have bundle || { skip "bundler: not installed"; return 0; }
   local v; v="$(tool_ver bundle)"; v="${v##* }"
   [ -n "$v" ] || { warn "bundler: installed but 'bundle --version' failed"; return 0; }
-  if ! bundle config set --global cooldown "$AGE_DAYS" >/dev/null; then
-    warn "bundler $v: 'bundle config set --global cooldown' failed; set BUNDLE_COOLDOWN=$AGE_DAYS instead"
-  elif ver_ge "$v" 4.0.13; then
+  if ! ver_ge "$v" 4.0.13; then
+    warn "bundler $v: cooldown needs bundler >= 4.0.13; not configured (gem update bundler)"
+    return 0
+  fi
+  if bundle config set --global cooldown "$AGE_DAYS" >/dev/null; then
     ok "bundler $v: cooldown=$AGE_DAYS days (bundle global config)"
   else
-    warn "bundler $v ignores cooldown (needs >= 4.0.13); wrote it anyway for when you upgrade"
+    warn "bundler $v: 'bundle config set --global cooldown' failed; set BUNDLE_COOLDOWN=$AGE_DAYS instead"
   fi
+}
+
+setup_gem() {
+  have gem || { skip "gem: not installed"; return 0; }
+  local v; v="$(tool_ver gem)"
+  [ -n "$v" ] || { warn "gem: installed but 'gem --version' failed"; return 0; }
+  if ! ver_ge "$v" 4.1.0; then
+    warn "gem $v: :cooldown: needs RubyGems >= 4.1.0; not configured (gem update --system)"
+    return 0
+  fi
+  # Older RubyGems sharing this file ignore unknown symbol keys, so other
+  # Rubies on the machine (rbenv, asdf...) keep working.
+  set_flat_key "$GEMRC_FILE" ":cooldown" ": " "$AGE_DAYS"
+  ok "gem $v: :cooldown: $AGE_DAYS days -> $GEMRC_FILE (gem install/update/outdated)"
 }
 
 setup_composer() {
@@ -425,7 +461,6 @@ setup_mise() {
 }
 
 note_unconfigured() {
-  have gem && info "gem: RubyGems only takes a --cooldown DAYS flag per command (no persisted setting configured here); Bundler's setting covers bundle installs"
   have pdm && info "pdm: strategy.exclude-newer exists but its user-level form isn't configured here; set it per project"
   have pixi && info "pixi: exclude-newer is project-level only ([workspace] in pixi.toml)"
   have conda && info "conda: not configured here; check your conda for an exclude_newer setting in ~/.condarc"
@@ -447,6 +482,7 @@ setup_uv
 setup_pip
 setup_poetry
 setup_cargo
+setup_gem
 setup_bundler
 setup_composer
 setup_hex

@@ -6,7 +6,7 @@
 time a package version must have been published before the resolver will
 install it — for every package manager on the machine that supports the
 concept natively, at the **user/global** level, in the config location each
-OS expects. Default window is 3 days (`--days N` / `COOLDOWN_DAYS` to
+OS expects. Default window is 7 days (`--days N` / `COOLDOWN_DAYS` to
 override).
 
 ### Non-scope
@@ -14,8 +14,8 @@ override).
 - Project-level configuration (project files override these settings; the
   script prints a reminder).
 - Third-party plugins (e.g. `cargo-cooldown`); only native settings.
-- Managers whose cooldown is project-only, flag-only, or whose user-level
-  form is unverified: RubyGems `gem` (`--cooldown DAYS` flag), pdm
+- Managers whose cooldown is project-only, env-only, or whose user-level
+  form is unverified: pdm
   (`strategy.exclude-newer`), pixi (`[workspace] exclude-newer`), conda,
   pipx (`PIPX_COOLDOWN` env var), pipenv (`Pipfile`). The script prints an
   `info` line for the installed ones instead of writing anything.
@@ -31,13 +31,17 @@ override).
    windows (Git Bash, where `$HOME` = `%USERPROFILE%`), else linux (WSL
    intentionally counts as linux).
 3. For each manager, in order (npm, pnpm, yarn, bun, deno, uv, pip, poetry,
-   cargo, bundler, composer, hex, mise): detect on `PATH` (`skip` if absent),
-   read version tolerantly (`tool_ver`; a broken shim warns instead of
-   aborting), check the minimum supported version, then write config.
+   cargo, gem, bundler, composer, hex, mise): detect on `PATH` (`skip` if
+   absent), read version tolerantly (`tool_ver`; a broken shim warns instead
+   of aborting), check the minimum supported version, then write config.
+   A version below the minimum produces a `warn` with the upgrade command
+   and **nothing is written** (see "Outdated managers" below).
    External config commands (`npm config set`, `pnpm config set`,
    `pip config`, `poetry config`, `bundle config`, `composer config`,
    `mix hex.config`, `mise settings set`) that fail produce a `warn` and the
-   script continues.
+   script continues. composer, hex and mise have no version gate: their
+   config commands reject unknown keys, so an outdated install fails that
+   command and gets a `warn` without anything being written.
 4. `note_unconfigured` prints `info` lines for installed managers the script
    deliberately does not configure.
 5. Exit 0 with a warning count; per-line statuses are `ok`/`warn`/`skip`/`info`.
@@ -55,7 +59,8 @@ override).
 | pip      | 26.1        | `uploaded-prior-to` (`PnD` duration)   | pip user config, `[global]` section (`pip config debug` shows the path) | `pip config --user set global.uploaded-prior-to` |
 | poetry   | 2.4.0       | `solver.min-release-age` (integer days)| poetry global `config.toml`                             | `poetry config` |
 | cargo    | 1.100 (stable); nightly 1.98–1.99 via `[unstable] min-publish-age` | `[registry] global-min-publish-age = "N days"` | `${CARGO_HOME:-~/.cargo}/config.toml` | direct TOML edit |
-| bundler  | 4.0.13      | `cooldown` (days)                      | Bundler global config                                   | `bundle config set --global` |
+| gem      | 4.1.0 (RubyGems) | `:cooldown:` (days; covers `gem install`, `update`, `outdated`) | `$GEMRC` (first entry), else `~/.gemrc`, else an existing `${XDG_CONFIG_HOME:-~/.config}/gem/gemrc` | direct file edit |
+| bundler  | 4.0.13 (third-party source; unconfirmed) | `cooldown` (days)  | Bundler global config                                   | `bundle config set --global` |
 | composer | recent 2.x  | `policy.cooldown.period` (`"N days"`)  | Composer global config                                  | `composer config --global` |
 | hex      | (present in 2.7) | `cooldown` (`"Nd"`)               | `${HEX_HOME:-~/.hex}`                                   | `mix hex.config` (stdin closed so a missing Hex can't prompt) |
 | mise     | (24h default) | `minimum_release_age` (`"Nd"`)       | `~/.config/mise/config.toml`                            | `mise settings set` |
@@ -63,6 +68,35 @@ override).
 Defaults that already apply without this script: pnpm ≥ 11 (1440 minutes),
 Deno ≥ 2.9 (24h), mise (24h), recent Yarn Berry. The script sets the chosen
 window explicitly, which can narrow a longer built-in default.
+
+## Outdated managers
+
+The script never writes a setting the installed version can't read. Some
+tools fail outright on keys they don't recognize, so writing "for when you
+upgrade" would break them; Yarn Berry < 4.10 rejects unknown `.yarnrc.yml`
+settings, for example. Behavior by case:
+
+- **Detected version too old:** `warn` naming the required version and the
+  upgrade command; the config file is left untouched.
+- **Version unreadable** (broken shim, toolchain missing): `warn`; nothing
+  written.
+- **Config command rejects the key** (composer, hex, mise): `warn`; nothing
+  written.
+- **Exception, cargo:** the `[registry]` key is written even below 1.100,
+  because one `config.toml` serves every rustup toolchain and older cargo
+  ignores unknown config keys.
+
+Shared config files can still be read by *other*, older copies of a tool
+than the one the script checked. The script prints an `info` line for the
+cases where that older copy would break or complain:
+
+| File | Older reader | Effect |
+|------|--------------|--------|
+| `~/.yarnrc.yml` | projects pinned to Berry < 4.10 | rejected; yarn refuses to run |
+| `uv.toml` | another uv < 0.9.17 | fails to parse the relative value |
+| pip user config | pip 26.0 in another venv | rejects `PnD` |
+| `~/.npmrc` (written for deno) | npm < 11.10 | prints an "unknown config" warning, keeps working |
+| `~/.gemrc` | RubyGems < 4.1 | ignores the key; safe |
 
 Manager-specific caveats printed at runtime:
 
@@ -120,8 +154,10 @@ Manager-specific caveats printed at runtime:
 - Only touches user-level config; never project files.
 - Portable across Linux (GNU or busybox userland) and macOS (BSD userland,
   Apple's bash 3.2): no bash ≥ 4 features, no GNU-only flags.
+- Never writes a setting the detected version can't read (cargo excepted;
+  see "Outdated managers").
 - Honors relocated configs: `XDG_CONFIG_HOME`, `CARGO_HOME`,
-  `NPM_CONFIG_USERCONFIG`; other tools locate their own files through their
+  `NPM_CONFIG_USERCONFIG`, `GEMRC`; other tools locate their own files through their
   config commands. `NO_COLOR` disables colored output.
 - On Windows the script assumes a bash environment (Git Bash/MSYS2/Cygwin)
   where home-dotfile paths coincide with what the native tools read; only uv

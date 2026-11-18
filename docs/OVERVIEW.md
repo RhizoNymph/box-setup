@@ -19,8 +19,9 @@ Features Index:
     description: >
       Set a minimum release age (supply-chain cooldown) for every installed
       package manager that supports it natively (npm, pnpm, yarn, bun, deno,
-      uv, pip, poetry, cargo, bundler, composer, hex, mise), warning where the
-      installed version is too old and noting managers it leaves alone.
+      uv, pip, poetry, cargo, gem, bundler, composer, hex, mise); default 7
+      days. Managers too old for their setting are warned about and left
+      untouched.
     entry_points: [scripts/cooldowns.sh]
     depends_on: []
     doc: docs/features/cooldowns.md
